@@ -5,6 +5,7 @@ import random
 import time
 import datetime
 import numpy as np
+import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -17,25 +18,42 @@ import torch.backends.cudnn as cudnn
 from sklearn.cluster import DBSCAN
 from MulticoreTSNE import MulticoreTSNE as TSNE
 
-from common.tools import AverageMeter, getTime, evaluate, predict_softmax, accuracy, ProgressMeter, Clothing1M_Dataset, predict_repre, Clothing1M_Unlabeled_Dataset
+from common.tools import AverageMeter, getTime, evaluate, predict_softmax, accuracy, ProgressMeter, \
+ predict_repre, Noisy_ostracods, Noisy_ostracods_unlabeled
 
 
-parser = argparse.ArgumentParser(description='PyTorch Clothing1M Training')
-parser.add_argument('--seed', default=7, type=int)
-parser.add_argument('--data_root', type=str, default='data/Clothing1M_Official/')
+parser = argparse.ArgumentParser(description='PyTorch Noisy_ostracods Training')
+parser.add_argument('--seed', default=2024, type=int)
+parser.add_argument('--data_root', type=str, default='data/Noisy_ostracods/')
 parser.add_argument('--data_percent', default=0.95, type=float, help='T1')
 parser.add_argument('--pretrain', action='store_false', help='pretrain')
-parser.add_argument('--lr', default=0.01, type=float)
+parser.add_argument('--lr', default=0.02, type=float)
 parser.add_argument('--weight_decay', default=0.001, type=float)
-parser.add_argument('--batch_size', default=64, type=int)
+parser.add_argument('--batch_size', default=128, type=int)
 parser.add_argument('--num_iters_epoch', default=10, type=int)
 parser.add_argument('--eps', default=0.04, type=float)
-parser.add_argument('--min_samples', default=100, type=float)
+parser.add_argument('--min_samples', default=1, type=float)
 parser.add_argument('--filter_num', action='store', type=int, nargs='*', default=[12])
 args = parser.parse_args()
 print(args)
 os.system('mkdir -p %s' % ('logs'))
 os.system('mkdir -p %s' % ('model'))
+
+train_data = pd.read_csv('/mnt/d/noisy_ostracods/datasets/ostracods_genus_trans_train.csv', header=None)
+val_data = pd.read_csv('/mnt/d/noisy_ostracods/datasets/ostracods_genus_trans_val.csv', header=None)
+test_data = pd.read_csv('/mnt/d/noisy_ostracods/datasets/ostracods_genus_trans_test.csv', header=None)
+
+args.num_classes = len(train_data[1].unique())
+print("num_classes:", args.num_classes)
+
+# split data and labels
+train_label = np.array(train_data[1].values)
+val_label = np.array(val_data[1].values)
+test_label = np.array(test_data[1].values)
+
+train_data = train_data[0].values
+val_data = val_data[0].values
+test_data = test_data[0].values
 
 if args.seed is not None:
     random.seed(args.seed)
@@ -83,8 +101,8 @@ def train_by_iter(model, train_iter, ceriation, train_optimizer, num_iter):
 
 
 def update_trainloader(model, train_data, train_noisy_labels, val_nums):
-    predict_dataset = Clothing1M_Unlabeled_Dataset(train_data, args.data_root, train_transform)
-    predict_loader = DataLoader(dataset=predict_dataset, batch_size=args.batch_size * 2, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
+    predict_dataset = Noisy_ostracods_unlabeled('train', train_transform)
+    predict_loader = DataLoader(dataset=predict_dataset, batch_size=args.batch_size * 2, shuffle=False, num_workers=16, pin_memory=True, drop_last=False)
     soft_outs = predict_softmax(predict_loader, model)
     probs, preds = torch.max(soft_outs.data, 1)
 
@@ -188,39 +206,43 @@ def calculate_Multicore_tSNE(features, n_jobs=8):
     return tx, ty
 
 
-train_transform = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.RandomCrop(224),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.6959, 0.6537, 0.6371), (0.3113, 0.3192, 0.3214)),
-])
+train_transform = transforms.Compose([transforms.Resize([224, 224]),
+                                          transforms.RandomChoice([transforms.RandomRotation([90, 90]),
+                                                                   transforms.RandomRotation([180, 180]),
+                                                                   transforms.RandomRotation([270, 270])],
+                                                                  p=[0.25, 0.25, 0.25]),
+                                          transforms.RandomHorizontalFlip(p=0.5),
+                                          transforms.RandomChoice([transforms.ColorJitter(brightness=0.5),
+                                                                   transforms.ColorJitter(brightness=0.5, hue=0.1)],
+                                                                  p=[0.3, 0.3]),
+                                          transforms.RandomGrayscale(0.5),
+                                          transforms.ToTensor(),
+                                          transforms.Normalize(
+                                              mean=[0.485, 0.456, 0.406],
+                                              std=[0.229, 0.224, 0.225])])
 
-transform_test = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize((0.6959, 0.6537, 0.6371), (0.3113, 0.3192, 0.3214)),
-])
-args.num_classes = 14
+transform_test = transforms.Compose([transforms.Resize([224, 224]),
+                                                transforms.ToTensor(),
+                                                transforms.Normalize(
+                                                    mean=[0.485, 0.456, 0.406],
+                                                    std=[0.229, 0.224, 0.225])])
+
 
 # Load data file
-kvDic = np.load(args.data_root + 'Clothing1m-data.npy', allow_pickle=True).item()
-val_data = kvDic['clean_val_data']
-val_labels = kvDic['clean_val_labels']
+val_labels = val_label
 val_nums = np.zeros(args.num_classes, dtype=int)
 for item in val_labels:
     val_nums[item] += 1
-val_dataset = Clothing1M_Dataset(val_data, val_labels, args.data_root, transform_test)
-val_loader = DataLoader(dataset=val_dataset, batch_size=args.batch_size * 2, num_workers=4, pin_memory=True, shuffle=False, drop_last=False)
+val_dataset = Noisy_ostracods(val_data, val_label, transform_test)
+val_loader = DataLoader(dataset=val_dataset, batch_size=args.batch_size * 2, num_workers=16, pin_memory=True, shuffle=False, drop_last=False)
 
-test_data = kvDic['test_data']
-test_labels = kvDic['test_labels']
-test_dataset = Clothing1M_Dataset(test_data, test_labels, args.data_root, transform_test)
-test_loader = DataLoader(dataset=test_dataset, batch_size=args.batch_size * 2, num_workers=4, pin_memory=True, shuffle=False, drop_last=False)
+# test_data = kvDic['test_data']
+# test_labels = kvDic['test_labels']
+test_dataset = Noisy_ostracods(test_data, test_label, transform_test)
+test_loader = DataLoader(dataset=test_dataset, batch_size=args.batch_size * 2, num_workers=16, pin_memory=True, shuffle=False, drop_last=False)
 
-original_train_data = kvDic['train_data']
-original_train_labels = kvDic['train_labels']
+original_train_data = train_data
+original_train_labels = train_label
 shuffle_index = np.arange(len(original_train_labels), dtype=int)
 np.random.shuffle(shuffle_index)
 original_train_data = original_train_data[shuffle_index]
@@ -230,8 +252,8 @@ original_train_labels = original_train_labels[shuffle_index]
 nosie_len = int(len(original_train_labels) * args.data_percent)
 whole_train_data = original_train_data[:nosie_len]
 whole_train_labels = original_train_labels[:nosie_len]
-train_dataset = Clothing1M_Dataset(whole_train_data, whole_train_labels, args.data_root, train_transform)
-train_loader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True, shuffle=True, drop_last=True)
+train_dataset = Noisy_ostracods(whole_train_data, whole_train_labels, train_transform)
+train_loader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, num_workers=16, pin_memory=True, shuffle=True, drop_last=True)
 
 model = create_model(args.pretrain)
 optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
@@ -257,11 +279,11 @@ rest_train_data = original_train_data[nosie_len:]
 rest_train_labels = original_train_labels[nosie_len:]
 confident_index, unconfident_index, class_weights = update_trainloader(model, rest_train_data, rest_train_labels, val_nums)
 print(confident_index.shape, unconfident_index.shape, class_weights.shape)
-predict_dataset = Clothing1M_Dataset(rest_train_data[confident_index], rest_train_labels[confident_index], args.data_root, transform_test)
+predict_dataset = Noisy_ostracods(rest_train_data[confident_index], rest_train_labels[confident_index], transform_test)
 predict_loader = DataLoader(dataset=predict_dataset, batch_size=args.batch_size, num_workers=8, pin_memory=True, shuffle=False, drop_last=False)
 
 # Extract features and gen tSNE
-base_filepath = "./model/clothing_base_" + str(args.seed) + ".hdf5"
+base_filepath = "./model/ostracod_base_" + str(args.seed) + ".hdf5"
 torch.save(model.state_dict(), base_filepath)
 model.fc = nn.Identity()
 features = predict_repre(predict_loader, model)
@@ -273,8 +295,8 @@ db_con_index, db_con_labels = scan_correct_subclass_filter(np.vstack((tx, ty)).T
 # Prepare corrected confident data
 re_train_data = rest_train_data[confident_index][db_con_index]
 re_train_labels = db_con_labels[db_con_index]
-re_dataset = Clothing1M_Dataset(re_train_data, re_train_labels, args.data_root, train_transform)
-re_loader = DataLoader(dataset=re_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True, shuffle=True, drop_last=True)
+re_dataset = Noisy_ostracods(re_train_data, re_train_labels, train_transform)
+re_loader = DataLoader(dataset=re_dataset, batch_size=args.batch_size, num_workers=16, pin_memory=True, shuffle=True, drop_last=True)
 
 # Continue to train
 model = create_model(args.pretrain)

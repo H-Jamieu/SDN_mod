@@ -2,6 +2,7 @@ import os
 import time
 import datetime
 import numpy as np
+import pandas as pd
 
 import torch
 import torch.nn.functional as F
@@ -245,6 +246,56 @@ class Clothing1M_Dataset(Dataset):
 
     def getData(self):
         return self.data, self.targets
+    
+class Noisy_ostracods(Dataset):
+    def __init__(self, data, labels, transform=None):
+        self.data = data
+        self.fixed_image_base_path = '/mnt/x/class_images' #'/mnt/e/data/ostracods_id/class_images'
+        self.transform = transform
+        self.labels = labels
+        self.root_dir = self.fixed_image_base_path
+    
+    def __getitem__(self, index):
+        img_paths, target = self.data[index], self.labels[index]
+
+        img_paths = os.path.join(self.root_dir, img_paths)
+        img = Image.open(img_paths).convert('RGB')
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        return img, target
+    
+    def get_plain_item(self, idx):
+        img_path = os.path.join(self.fixed_image_base_path, self.img_labels.iloc[idx, 0])
+        image = Image.open(img_path)
+        label = self.img_labels.iloc[idx, 1]
+        return image, label
+
+    def __len__(self):
+        return len(self.data)
+    
+class Noisy_ostracods_unlabeled(Dataset):
+    def __init__(self, train, transform=None):
+        self.fixed_annotation_path = f'/mnt/d/Noisy_ostracods/datasets/ostracods_genus_final_{train}.csv'
+        self.fixed_image_base_path = '/mnt/x/class_images' #'/mnt/e/data/ostracods_id/class_images'
+        self.transform = transform
+        self.train = train
+        self.img_labels = pd.read_csv(self.fixed_annotation_path, header=None)
+        # transform img_labels[,1] to a 1-d array of np-int8 as labels
+        self.targets = self.img_labels[1].values.astype(np.int8)
+        self.root_dir = self.fixed_image_base_path
+    
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.fixed_image_base_path, self.img_labels.iloc[idx, 0])
+        image = Image.open(img_path)
+        img2 = self.transform(image)
+        image = self.transform(image)
+        return image, img2
+    
+
+    def __len__(self):
+        return len(self.img_labels)
 
 
 class Clothing1M_Unlabeled_Dataset(Dataset):
