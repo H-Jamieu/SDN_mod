@@ -171,7 +171,7 @@ def predict(predict_loader, model):
     probs = []
 
     with torch.no_grad():
-        for images, _ in predict_loader:
+        for images, _, _ in predict_loader:
             if torch.cuda.is_available():
                 images = Variable(images).cuda()
                 logits = model(images)

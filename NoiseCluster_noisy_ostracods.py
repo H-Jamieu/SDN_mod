@@ -25,23 +25,25 @@ from common.tools import AverageMeter, getTime, evaluate, predict_softmax, accur
 parser = argparse.ArgumentParser(description='PyTorch Noisy_ostracods Training')
 parser.add_argument('--seed', default=2024, type=int)
 parser.add_argument('--data_root', type=str, default='data/Noisy_ostracods/')
-parser.add_argument('--data_percent', default=0.95, type=float, help='T1')
+parser.add_argument('--data_percent', default=1, type=float, help='T1')
 parser.add_argument('--pretrain', action='store_false', help='pretrain')
-parser.add_argument('--lr', default=0.02, type=float)
+parser.add_argument('--lr', default=0.005, type=float)
 parser.add_argument('--weight_decay', default=0.001, type=float)
 parser.add_argument('--batch_size', default=128, type=int)
 parser.add_argument('--num_iters_epoch', default=10, type=int)
 parser.add_argument('--eps', default=0.04, type=float)
 parser.add_argument('--min_samples', default=1, type=float)
-parser.add_argument('--filter_num', action='store', type=int, nargs='*', default=[12])
+parser.add_argument('--filter_num', action='store', type=int, nargs='*', default=[1])
 args = parser.parse_args()
 print(args)
 os.system('mkdir -p %s' % ('logs'))
 os.system('mkdir -p %s' % ('model'))
 
-train_data = pd.read_csv('/mnt/d/noisy_ostracods/datasets/ostracods_genus_trans_train.csv', header=None)
-val_data = pd.read_csv('/mnt/d/noisy_ostracods/datasets/ostracods_genus_trans_val.csv', header=None)
-test_data = pd.read_csv('/mnt/d/noisy_ostracods/datasets/ostracods_genus_trans_test.csv', header=None)
+model_save_path = f'./model_SDN_{args.seed}.pth'
+
+train_data = pd.read_csv('/mnt/d/noisy_ostracods/datasets/ostracods_genus_final_train.csv', header=None)
+val_data = pd.read_csv('/mnt/d/noisy_ostracods/datasets/ostracods_genus_final_val.csv', header=None)
+test_data = pd.read_csv('/mnt/d/noisy_ostracods/datasets/ostracods_genus_final_test.csv', header=None)
 
 args.num_classes = len(train_data[1].unique())
 print("num_classes:", args.num_classes)
@@ -63,7 +65,7 @@ if args.seed is not None:
 
 
 def create_model(pretrained):
-    model = torchvision.models.resnet50(pretrained=pretrained)
+    model = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.DEFAULT)
     model.fc = nn.Linear(2048, args.num_classes)
     return model.cuda()
 
@@ -75,6 +77,7 @@ def train_by_iter(model, train_iter, ceriation, train_optimizer, num_iter):
     top1 = AverageMeter('Acc@1', ':6.2f')
     progress = ProgressMeter(len(train_iter), [batch_time, losses, top1], prefix="Train ")
     end = time.time()
+    batch_id = -1
     for batch_idx in range(num_iter):
         try:
             images, labels = next(train_iter)
@@ -95,16 +98,18 @@ def train_by_iter(model, train_iter, ceriation, train_optimizer, num_iter):
         top1.update(acc1[0], images[0].size(0))
         batch_time.update(time.time() - end)
         end = time.time()
+        batch_id = batch_idx
 
-    progress.display(batch_idx)
+    progress.display(batch_id)
     return top1.avg, losses.avg
 
 
-def update_trainloader(model, train_data, train_noisy_labels, val_nums):
+def update_trainloader(model, train_noisy_labels, val_nums):
+    # confusing
     predict_dataset = Noisy_ostracods_unlabeled('train', train_transform)
     predict_loader = DataLoader(dataset=predict_dataset, batch_size=args.batch_size * 2, shuffle=False, num_workers=16, pin_memory=True, drop_last=False)
     soft_outs = predict_softmax(predict_loader, model)
-    probs, preds = torch.max(soft_outs.data, 1)
+    _, preds = torch.max(soft_outs.data, 1)
 
     confident_indexs = []
     unconfident_indexs = []
@@ -122,7 +127,15 @@ def update_trainloader(model, train_data, train_noisy_labels, val_nums):
     train_nums = np.zeros(args.num_classes, dtype=int)
     for item in preds[confident_index]:
         train_nums[item] += 1
-    class_weights = torch.FloatTensor(np.mean(train_nums) / train_nums * val_nums / np.mean(val_nums)).cuda()
+    
+    epsilon = 1e-8  # Small value to avoid division by zero
+    train_nums_safe = np.maximum(train_nums, epsilon)
+    val_nums_safe = np.maximum(val_nums, epsilon)
+
+    class_weights = torch.FloatTensor(
+        (np.mean(train_nums_safe) / train_nums_safe) * 
+        (val_nums_safe / np.mean(val_nums_safe))
+    ).cuda()
 
     return confident_index, unconfident_index, class_weights
 
@@ -183,6 +196,7 @@ def calculate_eucli_dis(feature_bank, guess_index, train_noisy_labels, top_min_p
             class_feature_bank = feature_bank[class_index]
 
             eucli_dis_matrix = torch.cdist(guess_feature, class_feature_bank)
+            print(eucli_dis_matrix.shape)
             close_dis, _ = eucli_dis_matrix.topk(k=close_point, dim=-1, largest=False)
             close_mean_dis = torch.mean(close_dis, dim=1)
             top_dis, _ = close_mean_dis.topk(k=top_min_point, dim=-1, largest=False)
@@ -261,30 +275,24 @@ scheduler = CosineAnnealingLR(optimizer, args.num_iters_epoch, args.lr / 100)
 train_nums = np.zeros(args.num_classes, dtype=int)
 for item in whole_train_labels:
     train_nums[item] += 1
-class_weights = torch.FloatTensor(np.mean(train_nums) / train_nums * val_nums / np.mean(val_nums)).cuda()
-criterion = nn.CrossEntropyLoss(weight=class_weights).cuda()
-
-step = 0
-train_iter = iter(train_loader)
-num_iter = int((len(train_iter) - 1) / args.num_iters_epoch)
-for iter_index in range(args.num_iters_epoch):
-    step += 1
-    train_acc, train_loss = train_by_iter(model, train_iter, criterion, optimizer, num_iter)
-    val_loss, val_acc = evaluate(model, val_loader, nn.CrossEntropyLoss(), "Step " + str(step) + ", Val Acc:")
-    test_loss, test_acc = evaluate(model, test_loader, nn.CrossEntropyLoss(), "Step " + str(step) + ", Test Acc:")
-    scheduler.step()
-
+print("train_nums:", train_nums)
 # Extract confident data with early stopping
-rest_train_data = original_train_data[nosie_len:]
-rest_train_labels = original_train_labels[nosie_len:]
-confident_index, unconfident_index, class_weights = update_trainloader(model, rest_train_data, rest_train_labels, val_nums)
+rest_train_data = original_train_data
+rest_train_labels = original_train_labels
+confident_index, unconfident_index, class_weights = update_trainloader(model, rest_train_labels, val_nums)
 print(confident_index.shape, unconfident_index.shape, class_weights.shape)
 predict_dataset = Noisy_ostracods(rest_train_data[confident_index], rest_train_labels[confident_index], transform_test)
 predict_loader = DataLoader(dataset=predict_dataset, batch_size=args.batch_size, num_workers=8, pin_memory=True, shuffle=False, drop_last=False)
 
+# print('Confidence index')
+# print(confident_index)
+
 # Extract features and gen tSNE
-base_filepath = "./model/ostracod_base_" + str(args.seed) + ".hdf5"
-torch.save(model.state_dict(), base_filepath)
+base_filepath = "./model/1700788613_0.937474_ostracods_genus_final_resnet_50.pth"
+model.load_state_dict(torch.load(base_filepath))
+
+# justlaod my pre-trained model
+
 model.fc = nn.Identity()
 features = predict_repre(predict_loader, model)
 tx, ty = calculate_Multicore_tSNE(features, -1)
@@ -293,8 +301,11 @@ tx, ty = calculate_Multicore_tSNE(features, -1)
 db_con_index, db_con_labels = scan_correct_subclass_filter(np.vstack((tx, ty)).T, args.eps, args.min_samples, rest_train_labels[confident_index], args.filter_num)
 
 # Prepare corrected confident data
-re_train_data = rest_train_data[confident_index][db_con_index]
+re_train_data = rest_train_data[confident_index]
 re_train_labels = db_con_labels[db_con_index]
+print("re_train_labels:", re_train_labels)
+print("re_train_data shape:", re_train_data.shape)
+print("retrain_data:", re_train_data[0])
 re_dataset = Noisy_ostracods(re_train_data, re_train_labels, train_transform)
 re_loader = DataLoader(dataset=re_dataset, batch_size=args.batch_size, num_workers=16, pin_memory=True, shuffle=True, drop_last=True)
 
@@ -312,16 +323,17 @@ criterion = nn.CrossEntropyLoss(weight=class_weights).cuda()
 best_val_acc = 0
 best_test_acc = 0
 re_iter = iter(re_loader)
-num_iter = int((len(re_iter) - 1) / args.num_iters_epoch)
+num_iter = int((len(re_iter)))
+if num_iter == 0:
+    num_iter = 10
 for iter_index in range(args.num_iters_epoch):
-    step += 1
     train_acc, train_loss = train_by_iter(model, re_iter, criterion, optimizer, num_iter)
-    val_loss, val_acc = evaluate(model, val_loader, nn.CrossEntropyLoss(), "Step " + str(step) + ", Val Acc:")
+    val_loss, val_acc = evaluate(model, val_loader, nn.CrossEntropyLoss(), ", Val Acc:")
     scheduler.step()
 
     if (val_acc > best_val_acc):
-        test_loss, test_acc = evaluate(model, test_loader, nn.CrossEntropyLoss(), "Step " + str(step) + ", Test Acc:")
+        test_loss, test_acc = evaluate(model, test_loader, nn.CrossEntropyLoss(), ", Test Acc:")
         best_val_acc = val_acc
         best_test_acc = test_acc
-
+torch.save(model.state_dict(), model_save_path)
 print(getTime(), "Best Test Acc:", best_test_acc)
